@@ -22,12 +22,21 @@
 
 package org.jipijapa.eclipselink;
 
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
+import java.util.List;
+
+import javax.management.MBeanServer;
+import javax.management.MBeanServerFactory;
 import javax.naming.NamingException;
 import javax.transaction.TransactionManager;
 
+import org.eclipse.persistence.internal.security.PrivilegedAccessHelper;
 import org.eclipse.persistence.platform.server.jboss.JBossPlatform;
 import org.eclipse.persistence.sessions.DatabaseSession;
 import org.eclipse.persistence.transaction.jboss.JBossTransactionController;
+import org.jipijapa.JipiLogger;
 
 /**
  * The fully qualified name of WildFlyServerPlatform must be set as the value of
@@ -51,6 +60,76 @@ public class WildFlyServerPlatform extends JBossPlatform {
     }
 
     /**
+     * Overrides the eclipselink base approach to obtain the mbean server, which
+     * is very costly due to do a MBeanServer count number of beans.
+     *
+     * <P>
+     * REFERENCES: <br>
+     * <a href="https://issues.jboss.org/browse/WFLY-9408">Wildfly 10 - The cost
+     * of creating the first eclipselink EntityManager during deployment is
+     * extremelly high due to MBeanServer.getMbeanCount() cost</a>
+     */
+    @Override
+    public MBeanServer getMBeanServer() {
+        if (mBeanServer == null) {
+            List<MBeanServer> mBeanServerList = null;
+            try {
+                if (PrivilegedAccessHelper.shouldUsePrivilegedAccess()) {
+                    try {
+                        mBeanServerList = AccessController
+                                .doPrivileged(new PrivilegedExceptionAction<List<MBeanServer>>() {
+                                    @Override
+                                    public List<MBeanServer> run() {
+                                        return MBeanServerFactory.findMBeanServer(null);
+                                    }
+                                });
+                    } catch (PrivilegedActionException pae) {
+                        // Skip the superclass impl of a JNDI lookup
+                    }
+                } else {
+                    mBeanServerList = MBeanServerFactory.findMBeanServer(null);
+                }
+                if (mBeanServer == null) {
+                    // Attempt to get the first MBeanServer we find - usually
+                    // there is only one - when agentId == null we return a List
+                    // of them
+                    if (mBeanServerList != null && !mBeanServerList.isEmpty()) {
+                        // Use the first MBeanServer by default - there may be
+                        // multiple domains each with their own MBeanServer
+                        mBeanServer = mBeanServerList.get(JMX_MBEANSERVER_INDEX_DEFAULT_FOR_MULTIPLE_SERVERS);
+                        if (mBeanServerList.size() > 1) {
+                            if (null != mBeanServer.getDefaultDomain()) {
+                                // Prefer no default domain, as WildFly does not
+                                // register an mbean server with a default
+                                // domain
+                                for (int i = 1; i < mBeanServerList.size(); i++) {
+                                    MBeanServer anMBeanServer = mBeanServerList.get(i);
+                                    if (null == anMBeanServer.getDefaultDomain()) {
+                                        mBeanServer = anMBeanServer;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // else {
+                    // Skip the superclass impl of trying
+                    // ManagementFactory.getPlatformMBeanServer()
+                    // if privileged access is disabled.
+                    // WildFly has already called that by the time this code
+                    // would get run, so if we
+                    // got here it's an error situation and we should just
+                    // return null
+                    // }
+                }
+            } catch (Exception e) {
+                JipiLogger.JPA_LOGGER.error(e.getLocalizedMessage(), e);
+            }
+        }
+        return mBeanServer;
+    }
+
+    /**
      * This class is not to be used because it will register the eclipselink
      * transaction listener using the wrong approach for wildfly.
      *
@@ -63,7 +142,6 @@ public class WildFlyServerPlatform extends JBossPlatform {
      */
     @Deprecated
     public static class JBossAS7TransactionController extends JBossTransactionController {
-
         @Override
         protected TransactionManager acquireTransactionManager() throws Exception {
             try {
